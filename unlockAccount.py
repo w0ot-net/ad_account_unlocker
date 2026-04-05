@@ -39,15 +39,6 @@ def datetime_to_filetime(dt):
     return int(delta.total_seconds() * 10_000_000)
 
 
-def ldap_escape(s):
-    """Escape special characters for LDAP filter values (RFC 4515)."""
-    s = s.replace('\\', '\\5c')
-    s = s.replace('*', '\\2a')
-    s = s.replace('(', '\\28')
-    s = s.replace(')', '\\29')
-    s = s.replace('\x00', '\\00')
-    return s
-
 
 class AccountUnlocker:
     def __init__(self, username, password, domain, options):
@@ -155,7 +146,7 @@ class AccountUnlocker:
 
     def findUser(self, ldapConnection, username):
         """Search for a user by sAMAccountName. Returns (dn, lockoutTime) or (None, None) if not found."""
-        escapedUser = ldap_escape(username)
+        escapedUser = escape_filter_chars(username)
         searchFilter = '(sAMAccountName=%s)' % escapedUser
 
         try:
