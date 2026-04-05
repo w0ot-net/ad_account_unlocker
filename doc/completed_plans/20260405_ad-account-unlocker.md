@@ -108,7 +108,7 @@ No other files are modified. The script is self-contained, depending only on `im
 All already installed on this system:
 
 - `impacket 0.11.0` — target parsing, LDAP connection, logger, ASN1 types (including `ModifyRequest`/`ModifyResponse`)
-- Python 3 standard library — `argparse`, `logging`, `sys`, `getpass`
+- Python 3 standard library — `argparse`, `logging`, `sys`, `getpass`, `datetime`
 
 ## Execution Notes
 

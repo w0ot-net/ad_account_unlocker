@@ -336,8 +336,6 @@ class AccountUnlocker:
 
 
 def main():
-    print(version.BANNER)
-
     parser = argparse.ArgumentParser(
         add_help=True,
         description='Unlock locked Active Directory accounts via LDAP.'
