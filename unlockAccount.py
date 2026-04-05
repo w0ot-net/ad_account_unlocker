@@ -7,27 +7,34 @@
 # Usage:
 #   python3 unlockAccount.py [[domain/]username[:password]@]<dc> -user <sAMAccountName>
 #   python3 unlockAccount.py [[domain/]username[:password]@]<dc> -user-file <file>
+#   python3 unlockAccount.py [[domain/]username[:password]@]<dc> -list
 
 import argparse
 import logging
 import sys
+from datetime import datetime
 
 from impacket import version
 from impacket.examples import logger
 from impacket.examples.utils import parse_target
-from impacket.ldap import ldap, ldapasn1
-from impacket.ldap.ldapasn1 import ModifyRequest, Operation, SearchResultEntry
+from ldap3.utils.conv import escape_filter_chars
+from impacket.ldap import ldap
+from impacket.ldap.ldapasn1 import ModifyRequest, Operation, Scope, SearchResultEntry, SimplePagedResultsControl
 from impacket.smbconnection import SMBConnection, SessionError
 
 
-def ldap_escape(s):
-    """Escape special characters for LDAP filter values (RFC 4515)."""
-    s = s.replace('\\', '\\5c')
-    s = s.replace('*', '\\2a')
-    s = s.replace('(', '\\28')
-    s = s.replace(')', '\\29')
-    s = s.replace('\x00', '\\00')
-    return s
+FILETIME_UNIX_OFFSET = 116444736000000000  # 100ns intervals between 1601-01-01 and 1970-01-01
+
+
+def filetime_to_datetime(ft):
+    """Convert Windows FILETIME to local-time datetime."""
+    return datetime.fromtimestamp((ft - FILETIME_UNIX_OFFSET) / 10_000_000)
+
+
+def datetime_to_filetime(dt):
+    """Convert UTC datetime to Windows FILETIME."""
+    delta = dt - datetime(1601, 1, 1)
+    return int(delta.total_seconds() * 10_000_000)
 
 
 class AccountUnlocker:
@@ -46,11 +53,10 @@ class AccountUnlocker:
         if options.hashes is not None:
             self.__lmhash, self.__nthash = options.hashes.split(':')
 
-        # Build baseDN from domain
         domainParts = self.__domain.split('.')
         self.baseDN = ','.join('dc=%s' % part for part in domainParts)
 
-    def getMachineName(self, target):
+    def _getMachineName(self, target):
         s = SMBConnection(target, target)
         try:
             s.login('', '')
@@ -75,15 +81,14 @@ class AccountUnlocker:
         """Establish LDAP connection and return it."""
         if self.__kdcHost is not None:
             target = self.__kdcHost
+        elif self.__kdcIP is not None:
+            target = self.__kdcIP
         else:
-            if self.__kdcIP is not None:
-                target = self.__kdcIP
-            else:
-                target = self.__remoteHost
+            target = self.__remoteHost
 
-            if self.__doKerberos:
-                logging.info('Getting machine hostname')
-                target = self.getMachineName(target)
+        if self.__kdcHost is None and self.__doKerberos:
+            logging.info('Getting machine hostname')
+            target = self._getMachineName(target)
 
         logging.info('Connecting to %s via LDAP' % target)
 
@@ -95,11 +100,12 @@ class AccountUnlocker:
                 logging.info('LDAP requires SSL, retrying with LDAPS')
                 ldapConnection = ldap.LDAPConnection('ldaps://%s' % target, self.baseDN, self.__kdcIP)
                 self._login(ldapConnection)
+            elif 'NTLMAuthNegotiate' in str(e):
+                logging.critical("NTLM negotiation failed. Probably NTLM is disabled. "
+                                 "Try to use Kerberos authentication instead (-k).")
+                raise
             else:
-                if 'NTLMAuthNegotiate' in str(e):
-                    logging.critical("NTLM negotiation failed. Probably NTLM is disabled. "
-                                     "Try to use Kerberos authentication instead (-k).")
-                elif self.__kdcIP is not None and self.__kdcHost is not None:
+                if self.__kdcIP is not None and self.__kdcHost is not None:
                     logging.critical("If the credentials are valid, check the hostname and IP address of KDC. "
                                      "They must match exactly each other.")
                 raise
@@ -117,7 +123,7 @@ class AccountUnlocker:
 
     def findUser(self, ldapConnection, username):
         """Search for a user by sAMAccountName. Returns (dn, lockoutTime) or (None, None) if not found."""
-        escapedUser = ldap_escape(username)
+        escapedUser = escape_filter_chars(username)
         searchFilter = '(sAMAccountName=%s)' % escapedUser
 
         try:
@@ -171,6 +177,103 @@ class AccountUnlocker:
 
         return False, 'No response received'
 
+    def listLocked(self):
+        """Query and display all currently locked accounts."""
+        ldapConnection = self.connect()
+        try:
+            logging.info('Querying domain lockout policy...')
+            results = ldapConnection.search(
+                searchBase=self.baseDN,
+                scope=Scope('baseObject'),
+                searchFilter='(objectClass=*)',
+                attributes=['lockoutDuration'],
+                sizeLimit=0
+            )
+
+            lockoutDuration = 0
+            for item in results:
+                if not isinstance(item, SearchResultEntry):
+                    continue
+                for attribute in item['attributes']:
+                    if str(attribute['type']) == 'lockoutDuration':
+                        lockoutDuration = int(str(attribute['vals'][0]))
+
+            if lockoutDuration == 0:
+                logging.info('Lockout duration: accounts stay locked until manually unlocked')
+            else:
+                minutes = abs(lockoutDuration) // 10_000_000 // 60
+                logging.info('Lockout duration: %d minutes' % minutes)
+
+            logging.info('Searching for locked accounts in %s...' % self.baseDN)
+            sc = SimplePagedResultsControl(size=100)
+            results = ldapConnection.search(
+                searchFilter='(&(objectCategory=person)(objectClass=user)(lockoutTime>=1))',
+                attributes=['sAMAccountName', 'lockoutTime'],
+                sizeLimit=0,
+                searchControls=[sc]
+            )
+
+            now_ft = datetime_to_filetime(datetime.utcnow())
+            locked_accounts = []
+
+            for item in results:
+                if not isinstance(item, SearchResultEntry):
+                    continue
+
+                sAMAccountName = ''
+                lockoutTime = 0
+
+                for attribute in item['attributes']:
+                    attr_type = str(attribute['type'])
+                    if attr_type == 'sAMAccountName':
+                        sAMAccountName = attribute['vals'][0].asOctets().decode('utf-8')
+                    elif attr_type == 'lockoutTime':
+                        lockoutTime = int(str(attribute['vals'][0]))
+
+                if lockoutTime == 0:
+                    continue
+
+                # Check if lockout is still active
+                if lockoutDuration == 0:
+                    still_locked = True
+                else:
+                    still_locked = lockoutTime + abs(lockoutDuration) > now_ft
+
+                if still_locked:
+                    locked_accounts.append((sAMAccountName, lockoutTime))
+
+            if not locked_accounts:
+                logging.info('No accounts currently locked out.')
+                return
+
+            col_name = 20
+            col_since = 25
+            col_expires = 25
+            header = '{0:<{w0}} {1:<{w1}} {2:<{w2}}'.format(
+                'sAMAccountName', 'Locked Since', 'Expires',
+                w0=col_name, w1=col_since, w2=col_expires)
+            separator = '{0} {1} {2}'.format('-' * col_name, '-' * col_since, '-' * col_expires)
+
+            print(header)
+            print(separator)
+
+            for sAMAccountName, lockoutTime in locked_accounts:
+                locked_since = str(filetime_to_datetime(lockoutTime))[:19]
+
+                if lockoutDuration == 0:
+                    expires = 'Never (manual unlock required)'
+                else:
+                    expires_ft = lockoutTime + abs(lockoutDuration)
+                    expires = str(filetime_to_datetime(expires_ft))[:19]
+
+                print('{0:<{w0}} {1:<{w1}} {2:<{w2}}'.format(
+                    sAMAccountName, locked_since, expires,
+                    w0=col_name, w1=col_since, w2=col_expires))
+
+            logging.info('%d account(s) currently locked out.' % len(locked_accounts))
+        finally:
+            ldapConnection.close()
+
     def run(self, users):
         ldapConnection = self.connect()
         try:
@@ -221,6 +324,9 @@ def main():
 
     parser.add_argument('target', action='store', help='[[domain/]username[:password]@]<targetName or address>')
 
+    parser.add_argument('-list', action='store_true',
+                        help='List all currently locked accounts and exit')
+
     group = parser.add_argument_group('target users')
     group.add_argument('-user', action='store', metavar='username',
                        help='sAMAccountName of the account to unlock')
@@ -256,7 +362,6 @@ def main():
 
     options = parser.parse_args()
 
-    # Init the example's logger theme
     logger.init(options.ts)
 
     if options.debug is True:
@@ -265,9 +370,12 @@ def main():
     else:
         logging.getLogger().setLevel(logging.INFO)
 
-    # Validate that at least one target user option is provided
-    if options.user is None and options.user_file is None:
-        logging.critical('Either -user or -user-file must be specified')
+    if options.list and (options.user is not None or options.user_file is not None):
+        logging.critical('-list cannot be used with -user or -user-file')
+        sys.exit(1)
+
+    if not options.list and options.user is None and options.user_file is None:
+        logging.critical('Either -list, -user, or -user-file must be specified')
         sys.exit(1)
 
     domain, username, password, remote_host = parse_target(options.target)
@@ -283,32 +391,34 @@ def main():
     if options.aesKey is not None:
         options.k = True
 
-    # Store remote_host for the class to use
     options.remote_host = remote_host
-
-    # Build the list of users to unlock
-    users = []
-    if options.user is not None:
-        users.append(options.user)
-
-    if options.user_file is not None:
-        try:
-            with open(options.user_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        users.append(line)
-        except IOError as e:
-            logging.critical('Error reading user file: %s' % str(e))
-            sys.exit(1)
-
-    if len(users) == 0:
-        logging.critical('No users to process')
-        sys.exit(1)
 
     try:
         unlocker = AccountUnlocker(username, password, domain, options)
-        unlocker.run(users)
+
+        if options.list:
+            unlocker.listLocked()
+        else:
+            users = []
+            if options.user is not None:
+                users.append(options.user)
+
+            if options.user_file is not None:
+                try:
+                    with open(options.user_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#'):
+                                users.append(line)
+                except IOError as e:
+                    logging.critical('Error reading user file: %s' % str(e))
+                    sys.exit(1)
+
+            if len(users) == 0:
+                logging.critical('No users to process')
+                sys.exit(1)
+
+            unlocker.run(users)
     except Exception as e:
         if logging.getLogger().level == logging.DEBUG:
             import traceback
