@@ -12,7 +12,7 @@
 import argparse
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 from impacket import version
 from impacket.examples import logger
@@ -27,14 +27,26 @@ FILETIME_UNIX_OFFSET = 116444736000000000  # 100ns intervals between 1601-01-01 
 
 
 def filetime_to_datetime(ft):
-    """Convert Windows FILETIME to local-time datetime."""
+    """Convert Windows FILETIME (UTC) to local-time datetime."""
     return datetime.fromtimestamp((ft - FILETIME_UNIX_OFFSET) / 10_000_000)
 
 
 def datetime_to_filetime(dt):
-    """Convert UTC datetime to Windows FILETIME."""
+    """Convert a datetime to Windows FILETIME (UTC)."""
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
     delta = dt - datetime(1601, 1, 1)
     return int(delta.total_seconds() * 10_000_000)
+
+
+def ldap_escape(s):
+    """Escape special characters for LDAP filter values (RFC 4515)."""
+    s = s.replace('\\', '\\5c')
+    s = s.replace('*', '\\2a')
+    s = s.replace('(', '\\28')
+    s = s.replace(')', '\\29')
+    s = s.replace('\x00', '\\00')
+    return s
 
 
 class AccountUnlocker:
@@ -53,8 +65,7 @@ class AccountUnlocker:
         if options.hashes is not None:
             self.__lmhash, self.__nthash = options.hashes.split(':')
 
-        domainParts = self.__domain.split('.')
-        self.baseDN = ','.join('dc=%s' % part for part in domainParts)
+        self.baseDN = ''
 
     def _getMachineName(self, target):
         s = SMBConnection(target, target)
@@ -110,6 +121,27 @@ class AccountUnlocker:
                                      "They must match exactly each other.")
                 raise
 
+        # Discover baseDN from RootDSE
+        results = ldapConnection.search(
+            searchBase='',
+            scope=Scope('baseObject'),
+            searchFilter='(objectClass=*)',
+            attributes=['defaultNamingContext'],
+            sizeLimit=0
+        )
+        for item in results:
+            if not isinstance(item, SearchResultEntry):
+                continue
+            for attribute in item['attributes']:
+                if str(attribute['type']) == 'defaultNamingContext':
+                    self.baseDN = attribute['vals'][0].asOctets().decode('utf-8')
+                    break
+
+        if not self.baseDN:
+            raise Exception('Could not discover baseDN from RootDSE')
+
+        logging.info('BaseDN: %s' % self.baseDN)
+
         return ldapConnection
 
     def _login(self, ldapConnection):
@@ -123,7 +155,7 @@ class AccountUnlocker:
 
     def findUser(self, ldapConnection, username):
         """Search for a user by sAMAccountName. Returns (dn, lockoutTime) or (None, None) if not found."""
-        escapedUser = escape_filter_chars(username)
+        escapedUser = ldap_escape(username)
         searchFilter = '(sAMAccountName=%s)' % escapedUser
 
         try:
@@ -213,7 +245,7 @@ class AccountUnlocker:
                 searchControls=[sc]
             )
 
-            now_ft = datetime_to_filetime(datetime.utcnow())
+            now_ft = datetime_to_filetime(datetime.now(timezone.utc))
             locked_accounts = []
 
             for item in results:
@@ -258,13 +290,13 @@ class AccountUnlocker:
             print(separator)
 
             for sAMAccountName, lockoutTime in locked_accounts:
-                locked_since = str(filetime_to_datetime(lockoutTime))[:19]
+                locked_since = filetime_to_datetime(lockoutTime).strftime('%Y-%m-%d %H:%M:%S')
 
                 if lockoutDuration == 0:
                     expires = 'Never (manual unlock required)'
                 else:
                     expires_ft = lockoutTime + abs(lockoutDuration)
-                    expires = str(filetime_to_datetime(expires_ft))[:19]
+                    expires = filetime_to_datetime(expires_ft).strftime('%Y-%m-%d %H:%M:%S')
 
                 print('{0:<{w0}} {1:<{w1}} {2:<{w2}}'.format(
                     sAMAccountName, locked_since, expires,
@@ -277,8 +309,6 @@ class AccountUnlocker:
     def run(self, users):
         ldapConnection = self.connect()
         try:
-            logging.info('BaseDN: %s' % self.baseDN)
-
             unlocked = 0
             skipped = 0
             errors = 0
