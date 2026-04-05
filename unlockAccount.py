@@ -151,6 +151,7 @@ class AccountUnlocker:
 
         try:
             results = ldapConnection.search(
+                searchBase=self.baseDN,
                 searchFilter=searchFilter,
                 attributes=['lockoutTime'],
                 sizeLimit=0
@@ -230,6 +231,7 @@ class AccountUnlocker:
             logging.info('Searching for locked accounts in %s...' % self.baseDN)
             sc = SimplePagedResultsControl(size=100)
             results = ldapConnection.search(
+                searchBase=self.baseDN,
                 searchFilter='(&(objectCategory=person)(objectClass=user)(lockoutTime>=1))',
                 attributes=['sAMAccountName', 'lockoutTime'],
                 sizeLimit=0,
