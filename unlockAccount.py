@@ -8,9 +8,6 @@
 #   python3 unlockAccount.py [[domain/]username[:password]@]<dc> -user <sAMAccountName>
 #   python3 unlockAccount.py [[domain/]username[:password]@]<dc> -user-file <file>
 
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
 import argparse
 import logging
 import sys
@@ -19,7 +16,7 @@ from impacket import version
 from impacket.examples import logger
 from impacket.examples.utils import parse_target
 from impacket.ldap import ldap, ldapasn1
-from impacket.ldap.ldapasn1 import ModifyRequest, Operation, ResultCode, SearchResultEntry
+from impacket.ldap.ldapasn1 import ModifyRequest, Operation, SearchResultEntry
 from impacket.smbconnection import SMBConnection, SessionError
 
 
@@ -54,8 +51,8 @@ class AccountUnlocker:
         self.baseDN = ','.join('dc=%s' % part for part in domainParts)
 
     def getMachineName(self, target):
+        s = SMBConnection(target, target)
         try:
-            s = SMBConnection(target, target)
             s.login('', '')
         except OSError as e:
             if 'timed out' in str(e):
@@ -92,22 +89,12 @@ class AccountUnlocker:
 
         try:
             ldapConnection = ldap.LDAPConnection('ldap://%s' % target, self.baseDN, self.__kdcIP)
-            if self.__doKerberos is not True:
-                ldapConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
-            else:
-                ldapConnection.kerberosLogin(self.__username, self.__password, self.__domain,
-                                             self.__lmhash, self.__nthash,
-                                             self.__aesKey, kdcHost=self.__kdcIP)
+            self._login(ldapConnection)
         except ldap.LDAPSessionError as e:
             if 'strongerAuthRequired' in str(e):
                 logging.info('LDAP requires SSL, retrying with LDAPS')
                 ldapConnection = ldap.LDAPConnection('ldaps://%s' % target, self.baseDN, self.__kdcIP)
-                if self.__doKerberos is not True:
-                    ldapConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
-                else:
-                    ldapConnection.kerberosLogin(self.__username, self.__password, self.__domain,
-                                                 self.__lmhash, self.__nthash,
-                                                 self.__aesKey, kdcHost=self.__kdcIP)
+                self._login(ldapConnection)
             else:
                 if 'NTLMAuthNegotiate' in str(e):
                     logging.critical("NTLM negotiation failed. Probably NTLM is disabled. "
@@ -119,6 +106,15 @@ class AccountUnlocker:
 
         return ldapConnection
 
+    def _login(self, ldapConnection):
+        """Authenticate to the given LDAP connection using NTLM or Kerberos."""
+        if self.__doKerberos is not True:
+            ldapConnection.login(self.__username, self.__password, self.__domain, self.__lmhash, self.__nthash)
+        else:
+            ldapConnection.kerberosLogin(self.__username, self.__password, self.__domain,
+                                         self.__lmhash, self.__nthash,
+                                         self.__aesKey, kdcHost=self.__kdcIP)
+
     def findUser(self, ldapConnection, username):
         """Search for a user by sAMAccountName. Returns (dn, lockoutTime) or (None, None) if not found."""
         escapedUser = ldap_escape(username)
@@ -127,7 +123,7 @@ class AccountUnlocker:
         try:
             results = ldapConnection.search(
                 searchFilter=searchFilter,
-                attributes=['lockoutTime', 'userAccountControl'],
+                attributes=['lockoutTime'],
                 sizeLimit=0
             )
         except ldap.LDAPSearchError as e:
@@ -177,40 +173,42 @@ class AccountUnlocker:
 
     def run(self, users):
         ldapConnection = self.connect()
-        logging.info('BaseDN: %s' % self.baseDN)
+        try:
+            logging.info('BaseDN: %s' % self.baseDN)
 
-        unlocked = 0
-        skipped = 0
-        errors = 0
+            unlocked = 0
+            skipped = 0
+            errors = 0
 
-        for username in users:
-            logging.info('Processing user: %s' % username)
+            for username in users:
+                logging.info('Processing user: %s' % username)
 
-            userDN, lockoutTime = self.findUser(ldapConnection, username)
+                userDN, lockoutTime = self.findUser(ldapConnection, username)
 
-            if userDN is None:
-                logging.error('  User not found: %s' % username)
-                errors += 1
-                continue
+                if userDN is None:
+                    logging.error('  User not found: %s' % username)
+                    errors += 1
+                    continue
 
-            if lockoutTime == 0:
-                logging.info('  lockoutTime: 0 (not locked)')
-                logging.info('  Account %s is not locked — skipping' % username)
-                skipped += 1
-                continue
+                if lockoutTime == 0:
+                    logging.info('  lockoutTime: 0 (not locked)')
+                    logging.info('  Account %s is not locked — skipping' % username)
+                    skipped += 1
+                    continue
 
-            logging.info('  lockoutTime: %d (locked)' % lockoutTime)
+                logging.info('  lockoutTime: %d (locked)' % lockoutTime)
 
-            success, error_msg = self.unlockUser(ldapConnection, userDN)
-            if success:
-                logging.info('  Successfully unlocked %s' % username)
-                unlocked += 1
-            else:
-                logging.error('  Failed to unlock %s: %s' % (username, error_msg))
-                errors += 1
+                success, error_msg = self.unlockUser(ldapConnection, userDN)
+                if success:
+                    logging.info('  Successfully unlocked %s' % username)
+                    unlocked += 1
+                else:
+                    logging.error('  Failed to unlock %s: %s' % (username, error_msg))
+                    errors += 1
 
-        logging.info('Done. %d account(s) unlocked, %d already unlocked, %d error(s).' % (unlocked, skipped, errors))
-        ldapConnection.close()
+            logging.info('Done. %d account(s) unlocked, %d already unlocked, %d error(s).' % (unlocked, skipped, errors))
+        finally:
+            ldapConnection.close()
 
 
 def main():
